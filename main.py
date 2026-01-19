@@ -48,7 +48,7 @@ from data_provider.akshare_fetcher import AkshareFetcher, RealtimeQuote, ChipDis
 from analyzer import GeminiAnalyzer, AnalysisResult, STOCK_NAME_MAP
 from notification import NotificationService, NotificationChannel, send_daily_report
 from search_service import SearchService, SearchResponse
-from stock_analyzer import StockTrendAnalyzer, TrendAnalysisResult
+from stock_analyzer import StockTrendAnalyzer, TrendAnalysisResult, BuySignal
 from market_analyzer import MarketAnalyzer
 
 # 配置日志格式
@@ -160,6 +160,7 @@ class StockAnalysisPipeline:
             tavily_keys=self.config.tavily_api_keys,
             serpapi_keys=self.config.serpapi_keys,
         )
+        self._prefer_system_signal = False
         
         logger.info(f"调度器初始化完成，最大并发数: {self.max_workers}")
         logger.info("已启用趋势分析器 (MA5>MA10>MA20 多头判断)")
@@ -320,6 +321,9 @@ class StockAnalysisPipeline:
             
             # Step 7: 调用 AI 分析（传入增强的上下文和新闻）
             result = self.analyzer.analyze(enhanced_context, news_context=news_context)
+            if result and self._prefer_system_signal and trend_result:
+                result.operation_advice = trend_result.buy_signal.value
+                result.sentiment_score = trend_result.signal_score
             
             return result
             
@@ -421,6 +425,106 @@ class StockAnalysisPipeline:
             return "明显放量"
         else:
             return "巨量"
+
+    def recommend_stock_codes(self, top_n: int = 5, candidate_limit: int = 500) -> List[str]:
+        """
+        基于趋势分析器的信号推荐股票代码列表
+
+        逻辑：从全市场筛出候选 -> 获取日线 -> 使用 StockTrendAnalyzer 信号打分
+        """
+        try:
+            df = self.akshare_fetcher.get_realtime_market_snapshot()
+            if df is None or df.empty:
+                logger.warning("实时行情数据为空，无法进行自动推荐")
+                return []
+
+            import pandas as pd
+
+            df = df.copy()
+
+            if '代码' not in df.columns:
+                logger.warning("实时行情缺少代码列，无法进行推荐")
+                return []
+            if '名称' not in df.columns:
+                df['名称'] = ''
+
+            df['代码'] = df['代码'].astype(str).str.zfill(6)
+            if '最新价' in df.columns:
+                df['最新价'] = pd.to_numeric(df['最新价'], errors='coerce').fillna(0.0)
+            else:
+                df['最新价'] = 0.0
+
+            mask = df['代码'].str.fullmatch(r'\d{6}')
+            mask &= df['代码'].str.match(r'^(0|3|6)\d{5}$')
+            mask &= ~df['名称'].astype(str).str.contains('ST|退', case=False, na=False)
+            mask &= df['最新价'] > 0
+            df = df[mask]
+
+            if df.empty:
+                logger.warning("实时行情过滤后为空，无法进行推荐")
+                return []
+
+            sort_col = None
+            for col in ['成交额', '成交量']:
+                if col in df.columns:
+                    sort_col = col
+                    df[col] = pd.to_numeric(df[col], errors='coerce').fillna(0.0)
+                    break
+
+            if sort_col:
+                df = df.sort_values(sort_col, ascending=False)
+            candidates = df.head(candidate_limit)['代码'].tolist()
+
+            logger.info(f"自动推荐候选池: {len(candidates)} 只股票")
+
+            analyzed = []
+            for code in candidates:
+                try:
+                    daily_df, _ = self.fetcher_manager.get_daily_data(code, days=60)
+                    if daily_df is None or daily_df.empty:
+                        continue
+                    trend_result = self.trend_analyzer.analyze(daily_df, code)
+                    analyzed.append((code, trend_result))
+                except Exception as e:
+                    logger.debug(f"[推荐] {code} 日线分析失败: {e}")
+
+            picks = [
+                item for item in analyzed
+                if item[1].buy_signal == BuySignal.STRONG_BUY
+            ]
+
+            if not picks:
+                logger.warning("未筛选到强烈买入信号的股票")
+                return []
+
+            signal_rank = {
+                BuySignal.STRONG_BUY: 3,
+                BuySignal.BUY: 2,
+                BuySignal.HOLD: 1,
+            }
+            picks = sorted(
+                picks,
+                key=lambda item: (
+                    signal_rank.get(item[1].buy_signal, 0),
+                    item[1].signal_score,
+                    item[1].trend_strength
+                ),
+                reverse=True
+            )
+            top = picks[:top_n]
+            codes = [code for code, _ in top]
+
+            logger.info("自动推荐股票列表(强烈买入):")
+            for code, result in top:
+                logger.info(
+                    f"  {code} 信号={result.buy_signal.value} "
+                    f"评分={result.signal_score} 趋势强度={result.trend_strength:.1f}"
+                )
+
+            return codes
+        except Exception as e:
+            logger.error(f"自动推荐股票失败: {e}")
+            return []
     
     def process_single_stock(
         self, 
@@ -512,11 +616,22 @@ class StockAnalysisPipeline:
             分析结果列表
         """
         start_time = time.time()
+        self._prefer_system_signal = False
         
         # 使用配置中的股票列表
         if stock_codes is None:
             self.config.refresh_stock_list()
             stock_codes = self.config.stock_list
+            if self.config.auto_recommend_enabled or not stock_codes:
+                recommended = self.recommend_stock_codes(self.config.recommend_top_n)
+                if not recommended:
+                    logger.error("自动推荐失败，未获取到股票列表")
+                    return []
+                stock_codes = recommended
+                self._prefer_system_signal = True
+                logger.info(f"已启用自动推荐，股票列表: {', '.join(stock_codes)}")
+            else:
+                self._prefer_system_signal = False
         
         if not stock_codes:
             logger.error("未配置自选股列表，请在 .env 文件中设置 STOCK_LIST")

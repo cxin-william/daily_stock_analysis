@@ -570,6 +570,61 @@ class AkshareFetcher(BaseFetcher):
             return self._get_etf_realtime_quote(stock_code)
         else:
             return self._get_stock_realtime_quote(stock_code)
+
+    def get_realtime_market_snapshot(self) -> pd.DataFrame:
+        """
+        获取A股实时行情快照（全市场）
+
+        Returns:
+            DataFrame，获取失败返回空 DataFrame
+        """
+        return self._get_a_share_realtime_df()
+
+    def _get_a_share_realtime_df(self) -> pd.DataFrame:
+        """
+        获取A股实时行情原始数据（带缓存）
+
+        数据来源：ak.stock_zh_a_spot_em()
+        """
+        import akshare as ak
+
+        # 检查缓存
+        current_time = time.time()
+        if (_realtime_cache['data'] is not None and
+                current_time - _realtime_cache['timestamp'] < _realtime_cache['ttl']):
+            logger.debug("[缓存命中] 使用缓存的A股实时行情数据")
+            return _realtime_cache['data']
+
+        last_error: Optional[Exception] = None
+        df = None
+        for attempt in range(1, 3):
+            try:
+                # 防封禁策略
+                self._set_random_user_agent()
+                self._enforce_rate_limit()
+
+                logger.info(f"[API调用] ak.stock_zh_a_spot_em() 获取A股实时行情... (attempt {attempt}/2)")
+                import time as _time
+                api_start = _time.time()
+
+                df = ak.stock_zh_a_spot_em()
+
+                api_elapsed = _time.time() - api_start
+                logger.info(f"[API返回] ak.stock_zh_a_spot_em 成功: 返回 {len(df)} 只股票, 耗时 {api_elapsed:.2f}s")
+                break
+            except Exception as e:
+                last_error = e
+                logger.warning(f"[API错误] ak.stock_zh_a_spot_em 获取失败 (attempt {attempt}/2): {e}")
+                time.sleep(min(2 ** attempt, 5))
+
+        # 更新缓存：成功缓存数据；失败也缓存空数据，避免同一轮任务对同一接口反复请求
+        if df is None:
+            logger.error(f"[API错误] ak.stock_zh_a_spot_em 最终失败: {last_error}")
+            df = pd.DataFrame()
+        _realtime_cache['data'] = df
+        _realtime_cache['timestamp'] = current_time
+
+        return df
     
     def _get_stock_realtime_quote(self, stock_code: str) -> Optional[RealtimeQuote]:
         """
@@ -578,45 +633,8 @@ class AkshareFetcher(BaseFetcher):
         数据来源：ak.stock_zh_a_spot_em()
         包含：量比、换手率、市盈率、市净率、总市值、流通市值等
         """
-        import akshare as ak
-        
         try:
-            # 检查缓存
-            current_time = time.time()
-            if (_realtime_cache['data'] is not None and 
-                current_time - _realtime_cache['timestamp'] < _realtime_cache['ttl']):
-                df = _realtime_cache['data']
-                logger.debug(f"[缓存命中] 使用缓存的A股实时行情数据")
-            else:
-                last_error: Optional[Exception] = None
-                df = None
-                for attempt in range(1, 3):
-                    try:
-                        # 防封禁策略
-                        self._set_random_user_agent()
-                        self._enforce_rate_limit()
-
-                        logger.info(f"[API调用] ak.stock_zh_a_spot_em() 获取A股实时行情... (attempt {attempt}/2)")
-                        import time as _time
-                        api_start = _time.time()
-
-                        df = ak.stock_zh_a_spot_em()
-
-                        api_elapsed = _time.time() - api_start
-                        logger.info(f"[API返回] ak.stock_zh_a_spot_em 成功: 返回 {len(df)} 只股票, 耗时 {api_elapsed:.2f}s")
-                        break
-                    except Exception as e:
-                        last_error = e
-                        logger.warning(f"[API错误] ak.stock_zh_a_spot_em 获取失败 (attempt {attempt}/2): {e}")
-                        time.sleep(min(2 ** attempt, 5))
-
-                # 更新缓存：成功缓存数据；失败也缓存空数据，避免同一轮任务对同一接口反复请求
-                if df is None:
-                    logger.error(f"[API错误] ak.stock_zh_a_spot_em 最终失败: {last_error}")
-                    df = pd.DataFrame()
-                _realtime_cache['data'] = df
-                _realtime_cache['timestamp'] = current_time
-
+            df = self._get_a_share_realtime_df()
             if df is None or df.empty:
                 logger.warning(f"[实时行情] A股实时行情数据为空，跳过 {stock_code}")
                 return None

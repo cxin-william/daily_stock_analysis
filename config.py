@@ -30,6 +30,8 @@ class Config:
     
     # === 自选股配置 ===
     stock_list: List[str] = field(default_factory=list)
+    auto_recommend_enabled: bool = False
+    recommend_top_n: int = 5
 
     # === 飞书云文档配置 ===
     feishu_app_id: Optional[str] = None
@@ -158,16 +160,25 @@ class Config:
         load_dotenv(dotenv_path=env_path)
         
         # 解析自选股列表（逗号分隔）
-        stock_list_str = os.getenv('STOCK_LIST', '')
+        env_path = Path(__file__).parent / '.env'
+        stock_list_str = ''
+        if env_path.exists():
+            env_values = dotenv_values(env_path)
+            stock_list_str = (env_values.get('STOCK_LIST') or '').strip()
+        if not stock_list_str:
+            stock_list_str = os.getenv('STOCK_LIST', '')
         stock_list = [
             code.strip() 
             for code in stock_list_str.split(',') 
             if code.strip()
         ]
-        
-        # 如果没有配置，使用默认的示例股票
-        if not stock_list:
-            stock_list = ['600519', '000001', '300750']
+
+        auto_recommend_env = os.getenv('AUTO_RECOMMEND')
+        if auto_recommend_env is None:
+            auto_recommend_enabled = not stock_list
+        else:
+            auto_recommend_enabled = auto_recommend_env.lower() == 'true'
+        recommend_top_n = int(os.getenv('RECOMMEND_TOP_N', '5'))
         
         # 解析搜索引擎 API Keys（支持多个 key，逗号分隔）
         bocha_keys_str = os.getenv('BOCHA_API_KEYS', '')
@@ -181,6 +192,8 @@ class Config:
         
         return cls(
             stock_list=stock_list,
+            auto_recommend_enabled=auto_recommend_enabled,
+            recommend_top_n=recommend_top_n,
             feishu_app_id=os.getenv('FEISHU_APP_ID'),
             feishu_app_secret=os.getenv('FEISHU_APP_SECRET'),
             feishu_folder_token=os.getenv('FEISHU_FOLDER_TOKEN'),
@@ -253,9 +266,6 @@ class Config:
             if code.strip()
         ]
 
-        if not stock_list:        
-            stock_list = ['000001']
-
         self.stock_list = stock_list
     
     def validate(self) -> List[str]:
@@ -267,7 +277,7 @@ class Config:
         """
         warnings = []
         
-        if not self.stock_list:
+        if not self.stock_list and not self.auto_recommend_enabled:
             warnings.append("警告：未配置自选股列表 (STOCK_LIST)")
         
         if not self.tushare_token:
