@@ -426,7 +426,7 @@ class StockAnalysisPipeline:
         else:
             return "巨量"
 
-    def recommend_stock_codes(self, top_n: int = 5, candidate_limit: int = 500) -> List[str]:
+    def recommend_stock_codes(self, top_n: int = 8, candidate_limit: int = 400) -> List[str]:
         """
         基于趋势分析器的信号推荐股票代码列表
 
@@ -464,15 +464,44 @@ class StockAnalysisPipeline:
                 logger.warning("实时行情过滤后为空，无法进行推荐")
                 return []
 
-            sort_col = None
-            for col in ['成交额', '成交量']:
-                if col in df.columns:
-                    sort_col = col
-                    df[col] = pd.to_numeric(df[col], errors='coerce').fillna(0.0)
-                    break
+            numeric_cols = ['成交额', '成交量', '涨跌幅', '量比', '换手率', '60日涨跌幅']
+            for col in numeric_cols:
+                if col not in df.columns:
+                    df[col] = 0.0
+                df[col] = pd.to_numeric(df[col], errors='coerce').fillna(0.0)
 
-            if sort_col:
-                df = df.sort_values(sort_col, ascending=False)
+            def normalize(series: pd.Series, low: float, high: float) -> pd.Series:
+                clipped = series.clip(lower=low, upper=high)
+                return (clipped - low) / (high - low)
+
+            liquidity = df['成交额'].where(df['成交额'] > 0, df['成交量'])
+            if liquidity.notna().any():
+                low_q = float(liquidity.quantile(0.2))
+                high_q = float(liquidity.quantile(0.95))
+            else:
+                low_q, high_q = 0.0, 1.0
+            if high_q <= low_q:
+                high_q = low_q + 1.0
+            liquidity_score = normalize(liquidity, low_q, high_q)
+
+            vol_ratio_score = 1.0 - (df['量比'] - 1.0).abs() / 2.0
+            vol_ratio_score = vol_ratio_score.clip(lower=0.0, upper=1.0)
+
+            turnover_score = 1.0 - (df['换手率'] - 6.0).abs() / 10.0
+            turnover_score = turnover_score.clip(lower=0.0, upper=1.0)
+
+            change_score = normalize(df['涨跌幅'], -2.0, 6.0)
+            mid_term_score = normalize(df['60日涨跌幅'], 0.0, 35.0)
+
+            df['candidate_score'] = (
+                0.35 * liquidity_score +
+                0.2 * vol_ratio_score +
+                0.2 * turnover_score +
+                0.15 * change_score +
+                0.1 * mid_term_score
+            )
+
+            df = df.sort_values(['candidate_score', '成交额', '成交量'], ascending=False)
             candidates = df.head(candidate_limit)['代码'].tolist()
 
             logger.info(f"自动推荐候选池: {len(candidates)} 只股票")
